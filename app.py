@@ -84,25 +84,47 @@ with st.sidebar:
 @st.cache_data(show_spinner=False, ttl=3600)
 def _info_for_ticker(t):
     tk = yf.Ticker(t)
-    mcap = None
-    try:
-        mcap = tk.fast_info.get("market_cap")
-    except Exception:
-        pass
+
+    # Name
     try:
         info = tk.info or {}
     except Exception:
         info = {}
+    name = info.get("shortName") or info.get("longName") or t
+
+    # Sector / Industry
     sector = info.get("sector") or "Unknown"
     industry = info.get("industry") or "Unknown"
-    if mcap is None:
-        mcap = info.get("marketCap")
-    name = info.get("shortName") or info.get("longName") or t
+
+    # Market cap — try fast_info, then info, then fallback: sharesOutstanding * previousClose
+    mcap = None
+    try:
+        fi = getattr(tk, "fast_info", {}) or {}
+        mcap = fi.get("market_cap", None)
+        if mcap is None:
+            mcap = info.get("marketCap", None)
+        if mcap is None:
+            shares = info.get("sharesOutstanding")
+            prev = fi.get("previous_close") or info.get("previousClose")
+            if shares and prev:
+                mcap = float(shares) * float(prev)
+    except Exception:
+        pass
+
     return dict(ticker=t, name=name, sector=sector, industry=industry, market_cap=mcap)
 
+
 @st.cache_data(show_spinner=False, ttl=900)
-def _price_return_for_tickers(tickers: List[str], start_date, end_date) -> Dict[str, float]:
-    data = yf.download(tickers=tickers, start=start_date, end=end_date, auto_adjust=True, progress=False, group_by="ticker")
+def _price_return_for_tickers(tickers, start_date, end_date):
+    # add a small buffer around the window to catch missing sessions
+    pad_start = start_date - timedelta(days=3)
+    pad_end = end_date + timedelta(days=1)
+
+    data = yf.download(
+        tickers=tickers, start=pad_start, end=pad_end,
+        auto_adjust=True, progress=False, group_by="ticker"
+    )
+
     rets = {}
     for t in tickers:
         try:
@@ -110,11 +132,20 @@ def _price_return_for_tickers(tickers: List[str], start_date, end_date) -> Dict[
                 s = data[(t, "Adj Close")].dropna()
             else:
                 s = data["Adj Close"].dropna()
+
+            # Trim back to the chosen window only, after the buffer
+            s = s[(s.index.date >= start_date) & (s.index.date <= end_date)]
+            # Fail-safe: if still <2 points, keep last 2 available from buffer
+            if len(s) < 2:
+                s = s.tail(2)
+
             if len(s) >= 2:
-                rets[t] = float((s.iloc[-1] / s.iloc[0]) - 1.0)
+                r = (s.iloc[-1] / s.iloc[0]) - 1.0
+                rets[t] = float(r)
         except Exception:
-            pass
+            continue
     return rets
+
 
 @st.cache_data(show_spinner=False, ttl=900)
 def _latest_price_change(tickers: List[str]) -> Dict[str, float]:
@@ -140,11 +171,20 @@ def _latest_price_change(tickers: List[str]) -> Dict[str, float]:
 # -----------------------
 with st.spinner("Fetching company info..."):
     meta = pd.DataFrame([_info_for_ticker(t) for t in tickers])
-    meta["market_cap"] = pd.to_numeric(meta["market_cap"], errors="coerce")
-    meta = meta.dropna(subset=["market_cap"])
 
+# Convert market cap; keep rows even if NaN
+meta["market_cap"] = pd.to_numeric(meta["market_cap"], errors="coerce")
+
+# Apply min market cap only where mcap is known
 if min_mcap > 0:
-    meta = meta[meta["market_cap"] >= min_mcap * 1e9]
+    known = meta["market_cap"].notna()
+    meta = pd.concat([
+        meta[known & (meta["market_cap"] >= min_mcap * 1e9)],
+        meta[~known]  # keep unknowns to avoid empty df
+    ])
+
+# Assign a tiny placeholder size for unknown market caps so they still render
+meta["market_cap_filled"] = meta["market_cap"].fillna(1e6)  # $1M placeholder
 
 with st.spinner("Fetching prices & computing returns..."):
     ret_map = _price_return_for_tickers(meta["ticker"].tolist(), start_date, end_date)
@@ -169,7 +209,7 @@ with tab_heatmap:
     fig = px.treemap(
         meta,
         path=["sector", "industry", "ticker"],
-        values="market_cap",
+        values="market_cap_filled",
         color="return",
         color_continuous_scale="RdYlGn",
         range_color=(cmin, cmax),
@@ -187,7 +227,7 @@ with tab_heatmap:
 
     st.markdown("### Data")
     cols = ["ticker","name","sector","industry","market_cap","return"]
-    st.dataframe(meta[cols].sort_values("market_cap", ascending=False), use_container_width=True)
+    st.dataframe(meta[cols].sort_values("market_cap_filled", ascending=False), use_container_width=True)
 
 with tab_sectors:
     st.subheader("Sector & Industry Breakdown")
